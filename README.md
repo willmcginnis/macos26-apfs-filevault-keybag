@@ -25,6 +25,14 @@ This write-up serves two audiences:
 > volume.** Host SIP was never disabled at any point; only *guest* SIP-off (inside a
 > VM the author controls) is used, which is a supported operation on a machine you own.
 
+> **Verification status.** Two parts of this write-up — the per-volume **HKDF
+> key-derivation** (Part 3) and the **universal same-account offline-unlock** method
+> (Part 5) — are **characterized from static kernel analysis and are NOT yet verified
+> end-to-end.** They are labelled *characterized / proof-pending* where they appear;
+> the offline reproduction against independently-known keys is still in progress.
+> Everything else — the on-disk keybag format, the failing password/PRK offline paths,
+> and the single-volume VEK-from-RAM recovery — is empirically verified as described.
+
 ---
 
 ## TL;DR — what unlocks offline, and what doesn't
