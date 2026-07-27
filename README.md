@@ -359,6 +359,33 @@ volume (Volume 5, UUID `66EB31C4-…`), the recovered key decrypts the real file
 1-byte-flipped tweak produces `invalid object type` — a positive-and-negative proof.
 The same recovery reproduced on a Linux `fsapfsmount` (below).
 
+## The one-time boot, minimally: keeping the original image pristine
+
+The working path needs exactly one boot to birth the key in RAM, and a normal boot
+mounts the Data volume read-write — so it dirties the disk. To keep the *original*
+`disk.img` byte-for-byte pristine, do that boot on a **copy**.
+
+On real hardware you would reach for a rescue environment (grml / a custom initramfs)
+that extracts only the key and never writes the target. A VZ macOS guest has no such
+hook: `VZMacOSBootLoader` boots the macOS on the guest's own disk, with no
+custom-kernel / initramfs injection point. The analog is cheaper here, though, because
+the guest disk is an APFS file — a **copy-on-write clone of `disk.img`** costs ~22 KiB
+of metadata (it shares every block with the source until it diverges):
+
+1. CoW-clone the VM (`tart clone` — an APFS clonefile; ~22 KiB, not a full copy).
+2. Boot the **clone**, disable *guest* SIP, unlock, extract the key(s) from the
+   clone's RAM, then discard the clone.
+3. The original `disk.img` is never booted — confirm it byte-identical by SHA-256
+   before and after. Every write the boot makes (SIP-off nvram, logs, mount dirtying)
+   lands on the disposable clone.
+
+(macOS recoveryOS — `tart run --recovery` — is the closer spiritual match to "don't
+boot the target OS at all," but in practice it exposes no Tart guest-agent shell
+channel and does not reliably ship a usable dtrace, so the proven extraction can't be
+scripted there. The CoW clone reuses the already-proven full-OS extraction environment
+while still leaving the original pristine, so it is the preferred realization of the
+"minimal boot" intent.)
+
 ---
 
 # Part 3 — Reading the VEK out of guest RAM
@@ -444,15 +471,37 @@ boundary, not on a per-volume secret data key. This was verified end-to-end by t
 oracle (correct key → 307,216 real entries; flipped tweak → garbage) and re-run
 independently.
 
-**Open question — 32-byte on-disk VEK vs 64-byte runtime key.** The on-disk keybag
-wraps a **32-byte** VEK (the 40-byte RFC-3394 `wrapped_vek` at tag `[3]`), but the
-RAM-recovered runtime key is **64 bytes** (AES-256-XTS). The mapping between the
-32-byte on-disk VEK (which is SEP-bound and cannot be unwrapped offline anyway) and
-the 64-byte runtime key is **unresolved**. One suggestive-but-untraced coincidence
-(INFERENCE): the runtime key's *non-zero* half is exactly 32 bytes, matching the
-on-disk VEK size — as if the on-disk 32-byte VEK supplies the tweak half while the
-data half is zeroed at setup. This is not confirmed; treat the cipher-width mapping as
-an open item.
+**The 32-byte on-disk VEK → 64-byte runtime key: the per-volume derivation.** The
+on-disk keybag wraps a **32-byte** VEK (the 40-byte RFC-3394 `wrapped_vek` at tag
+`[3]`), while the RAM-recovered runtime key is **64 bytes** (AES-256-XTS). A static
+read of the macOS 26.4.1 kernel's APFS key path (`_unmanaged_vek_unwrap_from_kek`)
+characterizes the mapping as a two-step derivation:
+
+```
+unwrapped = RFC3394_unwrap(KEK, wrapped_vek[40])              -> 32 bytes
+xts_seed  = HKDF-SHA256(IKM  = unwrapped[32],
+                        salt = APFS volume UUID [16 bytes],
+                        info = "vekderivedentropy\0" [18 bytes],
+                        L    = 32)                             -> 32 bytes
+```
+
+The HKDF salt is the volume's own APFS UUID (the same pointer is handed to
+`_uuid_to_string` immediately before the derivation). This step runs for the
+FileVault Data/group volume; a scratch / non-FileVault volume **skips** it (identity —
+the RFC-3394 output is used directly). The 32-byte `xts_seed` is consistent with the
+observed runtime key being **`(32 zero bytes) ‖ (32-byte derived value)`**: the
+derived value supplies the AES-256 **tweak** half, and the **data** half is the
+hardcoded all-zero AES-256 key (matching the systematic zero-data-key result — see
+Part 5). This resolves the earlier "why 32 on disk but 64 in RAM?" question in
+principle: the on-disk 32-byte VEK is not the runtime key, it is the HKDF *input*.
+
+**Status: characterized from static disassembly (INFERENCE), not yet proven
+end-to-end.** The chain above is read from the 26.4.1 kernel, not reproduced
+against ground truth here; the end-to-end check — derive `xts_seed` offline from a
+volume's on-disk `wrapped_vek` + UUID and confirm it equals that volume's
+independently RAM-recovered VEK — is **pending**. Treat the exact byte-level chain
+(and the `info` string / `L`) as characterized-not-confirmed until that reproduction
+runs.
 
 ## Cross-tool confirmation on Linux
 
@@ -530,11 +579,29 @@ against its Data volume via the patched oracle.
   `wrapped_kek`, same 16-byte metadata value (`96d725ec…`). So the **password→KEK
   path is deterministic**, while the **container VEK entry differs** (which is why the
   cross-inject fails). Deterministic KEK, per-enable VEK.
-- **Open lead.** A deterministic KEK is a strong hint that a *universal* offline
-  unlock could be reachable if the KEK's wrapping context can be reconstructed
-  off-device — the on-disk determinism means the only missing input is the
-  SEP-held/vSEP-held wrapping secret, not any per-volume randomness in the KEK path.
-  This is a lead, not a result.
+- **From open lead to a characterized method (end-to-end proof pending).** Two
+  on-disk facts compose into a route to a *reusable* offline unlock:
+  1. the **KEK is deterministic** per (account, password) — byte-identical on-disk KEK
+     records across independent volumes — yet is **not** offline-derivable from the
+     password (the wrap is SEP-bound); it is obtained **once**, by guest-RAM
+     extraction.
+  2. the per-volume step from KEK to XTS key uses **only on-disk material**:
+     `RFC3394_unwrap(KEK, wrapped_vek)` then `HKDF-SHA256(·, salt = the volume's APFS
+     UUID, info = "vekderivedentropy")` (Part 3).
+
+  Together these characterize a **"boot once, then unlock offline forever — across
+  volumes"** method: extract the deterministic KEK a single time from one volume's
+  boot, then for **any** same-account volume derive its XTS key from that volume's
+  on-disk `wrapped_vek` + UUID alone — no further boot, no SEP, no per-volume
+  extraction. **This is a characterized method, not yet a demonstrated result:** the
+  one-time KEK extraction and the full offline cross-derivation (KEK from volume A →
+  mount volume B from B's on-disk bytes, cross-checked against B's independently
+  RAM-recovered VEK) have not been run to completion here. One dependency gates the
+  *universality* specifically — whether the pre-unwrap `fv_hw_crypt` transform seen in
+  the static read is a pure function of on-disk bytes or is itself SEP-bound; if the
+  latter, the method narrows to flag-clear volumes. Stated honestly: the mechanism is
+  understood end-to-end on paper; the offline end-to-end *demonstration* is the
+  remaining work.
 
 **The zero data key is SYSTEMATIC — not a per-volume anomaly.**
 
@@ -595,6 +662,16 @@ per-enable and carries no cross-volume value, so no literal tweak is published h
   carry the same 16-byte wrapping-context value), not tested with a correct recovery key.
 - That the zero data key is systematic across *all* VZ FileVault volumes (beyond the two
   measured) — strongly supported at n = 2, not proven beyond the sample.
+- The per-volume `RFC-3394 → HKDF-SHA256(·, salt = volume UUID, info =
+  "vekderivedentropy")` derivation (Part 3) — read from a **static** disassembly of the
+  26.4.1 kernel, **not yet reproduced end-to-end** against the two known VEKs. The `info`
+  string, the `L = 32` length, and the exact split into (zero data ‖ derived tweak) are
+  characterized-not-confirmed.
+- That a single extracted KEK yields a *universal* (same-account) offline unlock — a
+  method characterized from the on-disk determinism + the HKDF-from-UUID step, but not
+  demonstrated end-to-end here, and contingent on the `fv_hw_crypt` transform being a
+  pure function of on-disk bytes (if it is SEP-bound, the method narrows to flag-clear
+  volumes).
 
 ## Prior-art check
 
@@ -625,6 +702,12 @@ Elcomsoft / Passware / hashcat; mac_apt / plaso.
   its enclosing length exactly, and re-encoding the parsed tag/length/value tree
   reproduces the original bytes. The full hex below lets a reader repeat both checks.
 - Host SIP was never disabled; only guest SIP-off (inside owned VMs) was used.
+- **Editorial scope — verified-or-omitted.** This write-up asserts only what was
+  checked here and deliberately *omits* operational specifics that were not confirmed,
+  rather than stating them speculatively. Where a mechanism is understood but its
+  end-to-end reproduction has not been run (the HKDF derivation and the universal
+  same-account unlock), it is labelled **characterized / proof-pending**, not claimed
+  as a result. Less asserted, but each assertion carries its evidence.
 
 ## Appendix — full record hex
 
