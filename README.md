@@ -1,20 +1,58 @@
-# macOS 26 APFS FileVault keybags — parser-compatibility notes and the expanded container VEK entry
+# Offline FileVault on Apple Virtualization.framework (Tart) macOS 26 guests — keybag format, the offline-unlock wall, and recovering your own volume key from guest RAM
 
-Byte-level notes on a macOS 26 FileVault APFS keybag, focused on where the two
-open-source offline APFS decrypters (libfsapfs, apfs-fuse) can and cannot parse it,
-and on one entry — the container keybag's wrapped-VEK entry — whose macOS 26 layout
-neither tool currently handles. Written to fill a gap in the public byte-level
-record and to give libfsapfs a concrete fix.
+Byte-level notes on a macOS 26 FileVault APFS keybag as it appears on an Apple
+Virtualization.framework guest, **plus** the two things a reader most often actually
+wants to know: **can you unlock such a volume offline, and if so, how.** The short
+answers are (1) *not* from the password or recovery key alone, and (2) *yes*, once
+you boot the guest one time and read the volume key out of the guest kernel's own
+memory. Both are documented below in full, with the failing attempts included.
 
-> **Scope & intent.** This is interoperability / digital-forensics documentation,
-> produced during legitimate offline data-recovery of a disposable macOS virtual
-> machine that the author owns and holds the password to. The sample bytes below
-> are captured key material (wrapped keys, HMACs, salts) from a throwaway VM that
-> is being destroyed and whose login password is the literal string `admin`,
-> published here alongside them — so nothing sensitive is disclosed. **No technique
-> in this document recovers a volume key from the disk image.** In fact, on the
-> guest examined here the password does *not* unlock the volume offline (see
-> "Offline unlock is not achieved by this decode").
+This write-up serves two audiences:
+
+- **libfsapfs / apfs-fuse maintainers** — the on-disk format and the concrete parser
+  fixes (Part 1, the prior-art check, and the appendix).
+- **Anyone recovering data from a macOS VM they own** — why the offline password path
+  cannot work, and the working RAM-extraction path that can (Parts 2–3).
+
+> **Scope & intent.** This is interoperability / digital-forensics / self-recovery
+> documentation, produced during legitimate offline data-recovery of *disposable
+> macOS virtual machines that the author owns and holds the password to.* Every
+> sample byte below — wrapped keys, HMACs, salts, and one recovered volume key — is
+> from a throwaway VM whose login is the literal `admin` / `admin` and which is being
+> destroyed, so nothing sensitive is disclosed. The one recovered volume key shown is
+> **per-volume, from that disposable VM — it is not a master key and (as the
+> universality section shows) does not decrypt any other independently-created
+> volume.** Host SIP was never disabled at any point; only *guest* SIP-off (inside a
+> VM the author controls) is used, which is a supported operation on a machine you own.
+
+---
+
+## TL;DR — what unlocks offline, and what doesn't
+
+| Approach (VM stopped, `disk.img` as a file on the host) | Result | Why |
+|---|---|---|
+| **Parse the keybag records** | works | Container keybag is AES-XTS under a key derived from the container UUID — no secret needed. Needs the parser fixes in Part 1. |
+| **Password → PBKDF2 → RFC-3394 unwrap of the KEK** | **FAILS** | The KEK is wrapped by a context that is not on disk. On a Virtualization.framework guest that context is the out-of-process **virtual Secure Enclave** (inference). ~150 enumerated variants, two independent implementations, and a second tool (apfs-fuse) all fail the RFC-3394 integrity check. |
+| **Personal Recovery Key (PRK) → RFC-3394 unwrap** | **FAILS (structural)** | The recovery record is an ordinary KEK record (Apple's standard recovery crypto-user UUID `EBC6C064-0000-11AA-AA11-00306543ECAC`) carrying the **same 16-byte wrapping-context value** as the password KEK, so the same SEP binding applies. (We did not hold the actual recovery key to test a correct-PRK unwrap directly — this is the structural argument.) |
+| **Boot once, read the VEK out of guest kernel RAM, then mount `disk.img` offline forever** | **WORKS** | Bulk FileVault decryption in this guest is *software* AES-XTS (no hardware AES engine services bulk reads), so the unwrapped volume key sits in guest kernel memory while the volume is mounted. Extract it, inject it into a patched libfsapfs, mount the image offline thereafter. |
+
+The rest of this document is the byte-level and mechanism detail behind each row.
+
+## The environment (observed on)
+
+- macOS **26.5.2**, build **25F84**, Apple Silicon, running as a guest under Apple
+  Virtualization.framework (via Tart), on a plain `disk.img` (virtio-blk;
+  `VZMacOSBootLoader`).
+- **Version-attribution caveat.** The keybag bytes were observed on 26.5.2 (and, for
+  the universality cross-check, 26.3). Earlier macOS was not tested, and the 22-byte
+  KEK metadata predates macOS 26 (apfs-fuse modeled it in 2023), so read "macOS 26" as
+  "observed on 26.x," not "introduced in macOS 26."
+- Whether the *expanded VEK entry* (Part 1) is tied to the Virtualization.framework
+  key-management path or is also present on physical Macs is **untested**.
+
+---
+
+# Part 1 — The on-disk keybag format (for libfsapfs / apfs-fuse maintainers)
 
 ## Summary
 
@@ -37,25 +75,8 @@ On a macOS 26 FileVault container:
    entry:** apfs-fuse's `DecodeVEK()` parses the prefix through `[3]` (the 40-byte
    wrapped VEK) and returns success while ignoring `[4]`–`[8]`, stopping at a literal
    `// HW encrypt has more here ... TODO`; libfsapfs rejects this sample earlier, on
-   the 22-byte metadata. This entry's byte-level layout is what this document mainly
-   contributes.
-
-Separately, and contrary to a common assumption: on the guest examined here the
-on-disk records parse cleanly but the **password does not unwrap the KEK offline**
-— see "Offline unlock is not achieved by this decode."
-
-## Observed on
-
-- macOS **26.5.2**, build **25F84**, Apple Silicon, running as a guest under Apple
-  Virtualization.framework (via Tart).
-- **Version-attribution caveat:** these bytes were only observed on macOS 26.5.2.
-  Earlier macOS was not tested, and the 22-byte metadata predates macOS 26 (apfs-fuse
-  modeled it in 2023), so treat "macOS 26" as "observed on 26.5.2," not "introduced
-  in macOS 26."
-- Whether the expanded VEK entry is tied to the Virtualization.framework
-  key-management path or is also present on physical Macs is **untested**. The
-  container keybag itself decrypts with no password (it is AES-XTS under a key
-  derived from the container UUID), so the records are fully readable offline.
+   the 22-byte metadata. This entry's byte-level layout is the main format
+   contribution here.
 
 ## Background: the two tools' models of the KEK metadata
 
@@ -86,7 +107,7 @@ The `metadata[2]` field is where the two tools disagree, and where libfsapfs is 
 
 The volumes here carry the 22-byte form, so apfs-fuse accepts it and libfsapfs
 rejects it. Note the first 4 bytes are `flags` in apfs-fuse's model, not
-`encryption_method`; the observed value (73) is not a valid libfsapfs
+`encryption_method`; the observed value (`73`) is not a valid libfsapfs
 `encryption_method` (`{0, 2, 16}`), consistent with it being a flags/other field.
 
 ## The KEK record (per-user), byte-level
@@ -212,7 +233,7 @@ patched build that reads both record types):
    not a valid method). As a compatibility choice, force method 0: its sizing
    (32-byte key, 40-byte wrap) matches the observed 40-byte `wrapped_key`, so parsing
    proceeds. This is a structural match, not a validated cipher identification — the
-   offline unwrap does not succeed (below).
+   offline unwrap does not succeed (Part 2).
 5. **Relax the `[4]`/`[5]` guards** for the container VEK entry: read `[4]` as an
    iteration count only when `<= 8` bytes, and `[5]` as a PBKDF2 salt only when
    exactly 16 bytes; otherwise leave them uninterpreted.
@@ -223,38 +244,359 @@ patched build that reads both record types):
 apfs-fuse would separately need `DecodeVEK()` extended past its `TODO` for the
 `[4]`–`[8]` fields.
 
-## Offline unlock is not achieved by this decode
+---
 
-Parsing the records is not the same as unlocking the volume. On the macOS 26 VZ guest
-examined here, the standard software-FileVault unwrap chain
+# Part 2 — What unlocks offline, and what doesn't
+
+Parsing the records is not the same as unlocking the volume. This part covers the two
+paths that *look* like they should work offline but don't, and then the path that
+does.
+
+## Password-only, no boot: FAILS
+
+On the macOS 26 VZ guest examined here, the standard software-FileVault unwrap chain
 
 ```
-KEK  = PBKDF2-HMAC-SHA256(password, salt[16], iterations)   -> 32 bytes
-KEK' = RFC3394_unwrap(KEK, wrapped_kek[40])                 -> fails integrity check
+derived = PBKDF2-HMAC-SHA256(password, salt[16], iterations)   -> 32 bytes
+KEK     = RFC3394_unwrap(derived, wrapped_kek[40])             -> fails integrity check
 ```
 
 **fails the RFC-3394 integrity check** (`A6A6A6A6A6A6A6A6`) with the correct login
-password. The failing matrix: PBKDF2-HMAC-SHA256 over the password in several
-encodings, against the on-disk salt and a few candidate salts, across the observed
-and neighbouring iteration counts, with 16- and 32-byte derived-key lengths and
-24-/40-byte wrap lengths (~150 combinations), cross-checked with two independent
-unwrap implementations (a pure-Python RFC-3394 and libfsapfs's C path). The
-personal-recovery-key record fails the same way.
+password — so the chain never reaches the VEK. The failing matrix: PBKDF2-HMAC-SHA256
+over the password in several encodings, against the on-disk salt and a few candidate
+salts, across the observed and neighbouring iteration counts, with 16- and 32-byte
+derived-key lengths and 24-/40-byte wrap lengths (~150 combinations), cross-checked
+with two independent unwrap implementations (a pure-Python RFC-3394 and libfsapfs's C
+path). A third, independent tool (apfs-fuse) reproduces the same failure (below).
 
 Stated narrowly: **on this guest, the documented software unwrap chain and every
 enumerated variant failed** — the KEK could not be derived from on-disk material.
 This does **not** prove no derivation exists (an undiscovered KDF or
-password-preprocessing step is not excluded), nor the mechanism. The most consistent
-*hypothesis* is that the KEK is bound to a wrapping context not present on disk — on
-a Virtualization.framework guest, KEK-wrapping is plausibly handled by the
-out-of-process virtual Secure Enclave that exists only while the VM runs — with the
-16-byte metadata value as a candidate context identifier. This was not traced to the
-vSEP image, so it remains a hypothesis. Still, it is a useful correction to the
-intuition that "a VM has no Secure Enclave, so its FileVault must be plain
-software-wrapped and offline-crackable": at least on this guest, the records parse
-but the offline password unwrap does not succeed.
+password-preprocessing step is not excluded); it establishes that the *documented*
+offline path does not work here.
 
-## Prior-art check (2026-07-26)
+**Why (inference).** The most consistent hypothesis for the failure is that the KEK
+is bound to a wrapping context that is **not present on disk**. On a
+Virtualization.framework guest, macOS 26 gives the VM "full-strength FileVault": the
+VM's identity is derived from the host's Secure Enclave, and KEK-wrapping is
+plausibly handled by the guest's **out-of-process virtual Secure Enclave (vSEP)**,
+which exists only while the VM runs. On-disk corroboration: the Preboot volume
+carries an `apticket…im4m` (an Image4 ticket bound to the VM's exact ECID), and the
+16-byte metadata value in the keybag records is a candidate wrapping-context
+identifier. **This SEP-binding is INFERENCE — it was not traced to the vSEP image**
+(that would require reverse-engineering the coprocessor image itself, a separate
+target). It is, however, a useful correction to the intuition that "a VM has no
+Secure Enclave, so its FileVault must be plain software-wrapped and
+offline-crackable": at least on this guest, the records parse but the offline
+password unwrap does not succeed, and a *virtual* SEP is present.
+
+## Personal Recovery Key (PRK): also FAILS
+
+The Personal Recovery Key does **not** provide an offline shortcut here either. The
+recovery record is structurally an ordinary KEK record — same 162-byte shape, same
+22-byte metadata with the same shared 16-byte value — keyed to Apple's **standard
+recovery crypto-user UUID `EBC6C064-0000-11AA-AA11-00306543ECAC`** (visible in the
+appendix hex). We did **not** hold the actual recovery key, so we did not run a
+correct-PRK unwrap directly — but the argument is **structural, and decisive**: both
+KEK records carry the **same 16-byte wrapping-context value** (`96d725ec…`), so whatever
+binds the password KEK binds the recovery KEK. The recovery path is SEP-bound the same
+way. (Candidate PRK derivation/normalization sweeps *without* the real key fail
+regardless of SEP binding, so they prove nothing on their own.) Whichever credential
+you hold, offline you are unwrapping a KEK whose wrapping context is not on the disk.
+
+## The crypto architecture — why the password path can't work offline but RAM can
+
+There are two independent crypto layers here; do not conflate them.
+
+| Layer | What | Where the key is | Offline? |
+|---|---|---|---|
+| **A — host disk-image encryption** (`per_io_encrypted` + DiskImages2) | the host decrypts blocks | host process (unwrapped from a host-SEP-derived key) | recoverable with the image passphrase |
+| **B — guest FileVault** (these VMs) | the guest decrypts; the host sees only ciphertext | guest kernel RAM (the VEK) | not via the host — you need the VEK |
+
+These Tart VMs are **Layer B on a plain `disk.img`**. The consequence that matters
+for recovery: **bulk FileVault decryption runs as software AES-XTS in the guest
+kernel.** In this Tart configuration no inline AES *hardware* engine is attached to
+the guest — the framework can register an emulated `apple.aes-engine` device, but it
+is not in these VMs' device set. (The guest's `AppleS8000AESAccelerator` IOKit driver
+is present but idle during bulk reads — its role is unlock-time key wrapping, not bulk
+decryption.) So the guest does the XTS itself. And ARMv8-A has no
+opaque AES key register: the `AESE`/`AESD` instructions consume round keys **from
+memory**, so a software XTS decrypt requires the expanded key schedule to be resident
+in guest RAM at decrypt time. **Therefore the unwrapped VEK sits in guest kernel
+memory the whole time the volume is mounted** — which is exactly the material the
+offline password path cannot reconstruct, but a one-time boot exposes.
+
+(The guest's VEK does *not* transit the host VM-runner process's normal heap: that
+process contains no guest-FileVault crypto at all, and the vSEP is a separate,
+out-of-process coprocessor. So the extraction target is the *guest's* RAM, not the
+host runner's.)
+
+## VEK-from-RAM: the working path (for self-recovery)
+
+If you own the VM and hold its password, this is how to get your data out offline —
+permanently, without the 2-concurrent-VM cap and with full xattr fidelity via a Linux
+FUSE mount:
+
+1. **Boot the guest once** and log in / unlock so the volume mounts and the VEK is
+   live in guest kernel RAM.
+2. **Disable *guest* SIP** (inside the VM you own; host SIP stays on) so you can read
+   guest kernel memory.
+3. **Capture the corecrypto AES-XTS context from guest kernel RAM** (via a
+   self-signed kext, KDP + a KDK, or a light dtrace read of the running XTS context —
+   see the tooling caveats in Part 3). You are looking for the `ccaes_xts` leaf's key
+   schedule, not a hardware register.
+4. **Invert the schedule to the raw key** (Part 3) and **concatenate data-key-half ‖
+   tweak-key-half** to form the AES-XTS VEK.
+5. **Verify the candidate against `disk.img`** with the patched-libfsapfs oracle
+   (Part 3) — correct key lists the real filesystem; a 1-byte-flipped tweak yields
+   garbage.
+6. **Mount the image offline, forever after**, with the injected VEK. No further boot
+   or SIP change is needed once the context is captured.
+
+This was carried out and independently re-verified. Against this disposable VM's Data
+volume (Volume 5, UUID `66EB31C4-…`), the recovered key decrypts the real filesystem
+(307,216 entries; `/private/etc/{hosts,kcpassword,…}` to exact content), and a
+1-byte-flipped tweak produces `invalid object type` — a positive-and-negative proof.
+The same recovery reproduced on a Linux `fsapfsmount` (below).
+
+---
+
+# Part 3 — Reading the VEK out of guest RAM
+
+## corecrypto arm64 "vng" AES key-schedule layout
+
+`aeskeyfind` finds nothing in these guest-RAM dumps, because it scans for x86-style
+AES-128 sequential / InvMixColumns schedules, whereas Apple's arm64 corecrypto
+("vng") stores **AES-256 schedules in an identity layout**. Once you know the layout,
+the key reads out directly.
+
+For an AES-XTS context, the two key schedules are **contiguous** at fixed offsets, one
+16-byte round key per round:
+
+- **Data-key schedule: base `ctx+0x10`.** Round `r` is at `ctx[0x10 + 16*r]`. Fifteen
+  round keys (AES-256) occupy 240 bytes, running from `0x10` up to `0x100`.
+- **Last-round marker at `ctx+0x100`.** This is the byte offset of the last round key
+  within a schedule: `0xE0` (= 14×16) for **AES-256**, `0xA0` (= 10×16) for
+  **AES-128**. It is the cheap discriminator for cipher width. (Between the data
+  schedule's end at `0x100` and the tweak schedule's start at `0x108` sit 8 bytes of
+  marker/count — the 240 round-key bytes + 8 = the `0x108 − 0x10` span.)
+- **Tweak-key schedule: base `ctx+0x108`.** Same shape, another 240 bytes.
+
+The round keys are **contiguous** — there is no working state interleaved between
+them (an earlier pass mis-described the layout that way; it is a plain contiguous
+schedule).
+
+**Encryption vs decryption schedule.** An *encryption* schedule holds the raw key at
+round 0, so `ctx[base : base+32]` is the raw 32-byte AES-256 key. A *decryption*
+schedule instead stores `InvMixColumns(key)` applied per 4-byte column (the
+equivalent-inverse-cipher form), so it must be **inverted** to recover the raw key.
+This was byte-verified: an XTS context's `ctx[0x10:0x100]` matched a computed AES-256
+schedule, and `dec_ctx = InvMixColumns(enc_ctx)` held per 4-byte column. So the raw
+key reads out as:
+
+```
+VEK = ctx[dataBase : dataBase+klen]  ‖  ctx[tweakBase : tweakBase+klen]
+      (klen = 32 for AES-256; invert first if this is a decryption schedule)
+```
+
+**A decoy to filter out.** A zero-*data*-key AES-256-XTS context fires constantly
+(an integrity / sealed-volume / self-test op) and an earlier extraction pass
+dismissed the real Data key as this "no-op decoy," precisely *because* it also has a
+zero data key. The resolution: the Data volume's VEK genuinely has an all-zero
+data-cipher half — the entropy lives entirely in the **tweak** key. What
+distinguishes the real Data key from a self-test context is therefore the **tweak,
+not the data key**. So do not filter on "non-zero data key"; sample many distinct
+contexts and **verify every candidate against the disk with the oracle** (below).
+
+## The oracle: patched libfsapfs `FSAPFS_INJECT_VEK`
+
+To test a candidate VEK against the image without any live SEP, patch libfsapfs so an
+`FSAPFS_INJECT_VEK=<hex>` environment variable is injected in
+`libfsapfs_internal_volume_unlock`, **bypassing** the SEP-bound keybag unwrap and
+applying a candidate raw VEK directly. Then:
+
+```
+FSAPFS_INJECT_VEK=<hex> fsapfsinfo -o <vol_offset> -f 5 -H <disk.img>
+```
+
+A wrong key fails the Fletcher-64 object checksum (`invalid object type`); the correct
+key lists the Data volume's file tree. This is the positive/negative test used to
+confirm the recovered key. (The unmodified libfsapfs is AES-128-XTS internally; a
+64-byte AES-256-XTS VEK needs the width extended in the patch — see the recovered-key
+note.)
+
+## The recovered key on this VM
+
+**Disposable-VM caveat first:** the value below is the volume key of *one throwaway VM
+that is being destroyed.* It is **per-volume, not a master key**; as Part 5 shows, it
+does **not** decrypt any independently-created volume.
+
+On this VM the recovered runtime key is a **64-byte AES-256-XTS** VEK:
+
+```
+data-cipher key : 00 00 … 00                                            (32 × 0x00)
+tweak key       : 776cbf2b5af564ccbdaa481931a56477e2a719408a424ca1ab1e9fe38e3013ca
+```
+
+**The striking observation:** the data-cipher half is **all zero** — the volume's
+confidentiality rests entirely on the 32-byte tweak plus the host `disk.img`
+boundary, not on a per-volume secret data key. This was verified end-to-end by the
+oracle (correct key → 307,216 real entries; flipped tweak → garbage) and re-run
+independently.
+
+**Open question — 32-byte on-disk VEK vs 64-byte runtime key.** The on-disk keybag
+wraps a **32-byte** VEK (the 40-byte RFC-3394 `wrapped_vek` at tag `[3]`), but the
+RAM-recovered runtime key is **64 bytes** (AES-256-XTS). The mapping between the
+32-byte on-disk VEK (which is SEP-bound and cannot be unwrapped offline anyway) and
+the 64-byte runtime key is **unresolved**. One suggestive-but-untraced coincidence
+(INFERENCE): the runtime key's *non-zero* half is exactly 32 bytes, matching the
+on-disk VEK size — as if the on-disk 32-byte VEK supplies the tweak half while the
+data half is zeroed at setup. This is not confirmed; treat the cipher-width mapping as
+an open item.
+
+## Cross-tool confirmation on Linux
+
+Reproduced independently in a throwaway Linux LXD container (since torn down):
+
+- **apfs-fuse** (HEAD `66b86bd`) parses the recent-macOS container + 22-byte KEK
+  metadata and mounts the *unencrypted* System volume read-only; on the encrypted Data
+  volume with the correct password it fails at the **RFC-3394 KEK-unwrap on both KEK
+  entries, never reaching the VEK** — the same SEP-bound signature, now reproduced by
+  a second, independent tool. (apfs-fuse is AES-128-XTS only and has no raw-VEK
+  injection path.)
+- **Payoff:** a patched libfsapfs + the injected recovered VEK produced a **real
+  Linux FUSE mount** (`fsapfsmount`); `ls` + file-content reads proved genuine
+  decryption. This is the "mount your own image offline forever" path realized on
+  Linux.
+
+---
+
+# Part 4 — What we tried and why it failed (the full record)
+
+Included because the dead ends are the useful part for anyone attempting this on
+their own VM.
+
+- **Password → PBKDF2 → RFC-3394 KEK unwrap: FAILED.** ~150 enumerated PBKDF2 /
+  RFC-3394 variants (encodings, salts, iteration counts, key/wrap lengths) all failed
+  the `A6A6…` integrity check with the correct password, cross-checked with two
+  independent unwrap implementations (pure-Python RFC-3394 and libfsapfs's C path).
+  Reproduced by a **third tool** (apfs-fuse) independently.
+- **Personal Recovery Key → offline unwrap: not achievable (structural).** We did not
+  hold the actual recovery key, so this was not tested with a correct PRK — but both KEK
+  records carry the same 16-byte wrapping-context value, so the recovery KEK is SEP-bound
+  exactly like the password KEK; neither credential unwraps offline. (Candidate
+  PRK-normalization sweeps without the real key fail regardless.)
+- **`tart suspend` save-state: not usable.** Per WWDC23, the save-state is
+  hardware-encrypted and host+user bound.
+- **`dtrace -A` anonymous boot-time tracing: does NOT work on macOS 26.** Anonymous
+  tracing state is not persisted across reboot — after boot the probes report "No
+  anonymous tracing state," so you cannot capture the key-schedule expansion at
+  unlock-time via anonymous dtrace.
+- **Return-time context dump: failed.** Hooking the corecrypto XTS wrapper at RETURN
+  (instead of entry) gave `entry == return` with the raw key not in `arg0` — so the
+  entry hook, capturing the live `ccxts_ctx`, was the route that worked.
+- **The zero-key "decoy" XTS context misled an earlier pass.** A zero-*data*-key
+  AES-256-XTS self-test context fires constantly and was mistaken for a no-op,
+  causing the real Data key to be dismissed (it, too, has a zero data key). The
+  discriminator turned out to be the *tweak*. (See Part 3.)
+- **What finally worked: the raw VEK from the corecrypto XTS context in guest RAM.**
+  Capture the running AES-XTS context, read the contiguous vng schedules at
+  `ctx+0x10` / `ctx+0x108`, invert if it is a decryption schedule, concatenate, and
+  verify against `disk.img` with the patched-libfsapfs oracle. Once captured, the
+  image mounts offline indefinitely.
+
+---
+
+# Part 5 — Universality: the VEK is not a universal constant, but the KEK path is deterministic
+
+A separate test settled whether the recovered key is anything like an Apple-wide
+constant. It is not — but the result has a second half that is more interesting for
+the format record.
+
+Method: cloned the pristine upstream `macos-tahoe-base` image (ships FileVault OFF),
+enabled FileVault **freshly and independently** on the clone (its own new VEK, macOS
+26.3), let it encrypt to 100%, stopped it, and injected the previously-recovered VEK
+against its Data volume via the patched oracle.
+
+- **Result: the inject FAILED** (`invalid object type`, identical to the negative
+  control). **The recovered VEK does not decrypt an independently-enabled volume —
+  the VEK / tweak is NOT a universal Apple constant.** (Where a single recovered VEK
+  *had* decrypted several sibling VMs, that was **copy-on-write clone inheritance**:
+  they all descended from one base image whose FileVault was enabled once.)
+- **The interesting half: the KEK path is deterministic.** Across the two
+  *independently created* volumes — different lineages, different ECIDs, macOS
+  26.3 vs 26.5.2 — the **volume-keybag KEK records are byte-identical**: same HMAC,
+  same admin crypto-user UUID (`faa413cd…`), same PBKDF2 salt (`5142af0b…`), same
+  `wrapped_kek`, same 16-byte metadata value (`96d725ec…`). So the **password→KEK
+  path is deterministic**, while the **container VEK entry differs** (which is why the
+  cross-inject fails). Deterministic KEK, per-enable VEK.
+- **Open lead.** A deterministic KEK is a strong hint that a *universal* offline
+  unlock could be reachable if the KEK's wrapping context can be reconstructed
+  off-device — the on-disk determinism means the only missing input is the
+  SEP-held/vSEP-held wrapping secret, not any per-volume randomness in the KEK path.
+  This is a lead, not a result.
+
+**The zero data key is SYSTEMATIC — not a per-volume anomaly.**
+
+A RAM extraction of the independently-enabled volume's live VEK settled it
+(oracle-verified: positive decrypt of ~287k real entries + two negative controls).
+That volume is **also AES-256-XTS with an all-zero data-cipher key**, and a
+**different** tweak. So across two independently created volumes — distinct lineages,
+distinct ECIDs, macOS 26.3 vs 26.5.2 — the **data half is all-zero both times while the
+tweak differs**: the zero-data-key property is **systematic**, and only the tweak key
+carries entropy (per-`fdesetup`-enable).
+
+Security consequence: in this VZ software-FileVault path the XTS **data** cipher runs
+under a publicly-known constant (all-zero) key — effectively a fixed, public
+permutation — so confidentiality of these Data volumes rests **entirely** on the secret
+tweak key plus the host `disk.img` boundary, not on any per-volume secret *data* key.
+(n = 2 — a strong systematic inference for the zero data key; the specific tweak is
+per-enable and carries no cross-volume value, so no literal tweak is published here.)
+
+---
+
+## Confidence — FACT vs INFERENCE
+
+**FACT:**
+
+- The on-disk keybag byte layout (KEK records, expanded 388-byte VEK entry) and all
+  the length checks; the libfsapfs parser bugs (DER big-endian, nested long-form,
+  22-byte metadata, `[4]`/`[5]` guards); the container keybag opening with no secret
+  (container-UUID-derived key).
+- Password offline unwrap fails the RFC-3394 integrity check with the correct password
+  (~150-combo sweep, cross-checked with two independent unwrap implementations).
+- Bulk FileVault decryption in this guest is software AES-XTS, and the unwrapped VEK
+  is resident in guest kernel RAM while the volume is mounted (binary trace + the
+  successful extraction).
+- The corecrypto vng schedule layout (contiguous 16-byte round keys; data base
+  `0x10`, tweak base `0x108`; `0xE0`/`0xA0` last-round marker at `ctx+0x100`;
+  enc-schedule holds the raw key, dec-schedule holds `InvMixColumns(key)` per column
+  and must be inverted) — byte-verified.
+- VEK-from-RAM works: a 64-byte AES-256-XTS key that decrypts the Data volume,
+  oracle-verified positive (real filesystem, 307,216 entries) and negative
+  (1-byte-flipped tweak → garbage), re-run independently and reproduced as a Linux
+  FUSE mount.
+- The VEK is not a universal Apple constant (independent FileVault-enable → inject
+  fails); the KEK records are byte-identical across independent volumes (deterministic
+  password→KEK path).
+- Both independently-extracted volumes' VEKs have an all-zero AES-256-XTS **data** key
+  (only the tweak differs) — the zero data key is systematic across the two (n = 2).
+
+**INFERENCE:**
+
+- That the guest FileVault KEK-wrapping is specifically SEP / vSEP-transformed.
+  Well-supported — every enumerated offline unwrap fails; the Preboot `apticket…im4m`
+  binds to the exact ECID; the 16-byte metadata value is a candidate wrapping-context
+  id — but **not line-traced to the vSEP image** (that is a separate reversing
+  target).
+- The relationship between the 32-byte on-disk VEK and the 64-byte runtime key (the
+  matching 32-byte non-zero half is suggestive, not confirmed).
+- That the PRK path is SEP-bound like the password path — structural (both KEK records
+  carry the same 16-byte wrapping-context value), not tested with a correct recovery key.
+- That the zero data key is systematic across *all* VZ FileVault volumes (beyond the two
+  measured) — strongly supported at n = 2, not proven beyond the sample.
+
+## Prior-art check
 
 Searched: the libfsapfs and apfs-fuse issue trackers, PRs, and source; the libfsapfs
 APFS asciidoc spec; Joe Sylve's APFS series; Eclectic Light's FileVault corpus;
@@ -274,11 +616,15 @@ Elcomsoft / Passware / hashcat; mac_apt / plaso.
 ## Provenance
 
 - Sample bytes are captured key material from a disposable macOS 26.5.2 (25F84) VZ
-  guest that is being retired; its login password is the literal `admin`, published
+  guest that is being retired; its login is the literal `admin` / `admin`, published
   alongside, so nothing sensitive is disclosed.
+- The one recovered volume key shown is per-volume and from that same disposable VM;
+  it is not a master key and does not decrypt any independently-created volume
+  (Part 5).
 - "DER-validated" / "round-trip" mean: every TLV length was parsed and re-summed to
   its enclosing length exactly, and re-encoding the parsed tag/length/value tree
   reproduces the original bytes. The full hex below lets a reader repeat both checks.
+- Host SIP was never disabled; only guest SIP-off (inside owned VMs) was used.
 
 ## Appendix — full record hex
 
@@ -292,7 +638,8 @@ Per-user KEK record (162 bytes):
 ```
 
 Personal-recovery-key KEK record (162 bytes; note the identical 16-byte metadata
-value and identical `49000000 0200` header):
+value, identical `49000000 0200` header, and the standard recovery crypto-user UUID
+`EBC6C064-0000-11AA-AA11-00306543ECAC`):
 
 ```
 30819f80010081205ab0a14dbebcdf6bea99bf48e9cdd25efcf63bedd032fce49a00c55c427d85fd82088c69cac5ecf63a99a36e8001008110ebc6c064000011aaaa1100306543ecac821649000000020096d725ec34d842ac9764e43f81804f578328d19275df338b1b76836c09fa1234b9355d4faceee251d7f45492ac33e1fd0defaefd614db143ba6584030a6b258510d83c493c5a1078ddc1e36b3d4d37dfa7
