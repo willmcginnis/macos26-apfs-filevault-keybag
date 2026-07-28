@@ -25,11 +25,12 @@ This write-up serves two audiences:
 > volume.** Host SIP was never disabled at any point; only *guest* SIP-off (inside a
 > VM the author controls) is used, which is a supported operation on a machine you own.
 
-> **Verification status (updated 2026-07-28).** The full offline-access chain is now
-> **verified end-to-end** on a genuinely-new volume: the per-volume **HKDF
-> key-derivation** (Part 3) and the **VEK-from-RAM → offline-mount** method both
-> reproduce — real directory listing + file contents + a failing 1-bit-flip negative
-> control, with the target `disk.img` **SHA-256 identical before and after.** What
+> **Verification status (updated 2026-07-28).** The **VEK-from-RAM → offline-mount**
+> method is now **verified end-to-end** on a genuinely-new volume — real directory listing
+> + file contents + a failing 1-bit-flip negative control, with the target `disk.img`
+> **SHA-256 identical before and after.** (The on-disk per-volume **HKDF key-derivation**
+> of Part 3 remains characterized from static disassembly — end-to-end reproduction still
+> pending.) What
 > changed the *other* way: the **"universal same-account offline-unlock"** (Part 5) is
 > now **DISPROVEN for independent machines** — the account KEK is **vSEP/machine-bound**,
 > so it holds only within a *shared-vSEP clone family*, not across independently-created
@@ -166,8 +167,9 @@ established by the bytes. Sample size is three records in one container.
 > fingerprint.** A genuinely-independent install (fresh IPSW → its own machine identity → its own
 > vSEP) carries a **different** value here — `d4ee8731…` vs this container's `96d725ec…` — while it
 > stays byte-identical across BOTH crypto-user records *within* each install. So the "inference"
-> that it is a key-wrapping context is confirmed, and it is precisely what makes the account KEK
-> **machine-bound** (a foreign-vSEP reader can't unlock — Part 5).
+> that it is a key-wrapping context is confirmed. It is a per-install **label/fingerprint** of
+> the machine-binding — evidence of it, not the mechanism; the binding itself is the off-disk
+> **vSEP-UID tangle** (a foreign-vSEP reader can't unlock — Part 5).
 
 ## The container VEK entry (`KB_TAG_VOLUME_KEY`) — the under-documented part
 
@@ -743,8 +745,9 @@ XTS oracle. The original disk is never mounted or written.
   (1-byte-flipped tweak → garbage), re-run independently and reproduced as a Linux
   FUSE mount.
 - The VEK is not a universal Apple constant (independent FileVault-enable → inject
-  fails); the KEK records are byte-identical across independent volumes (deterministic
-  password→KEK path).
+  fails). KEK records are byte-identical **only within a shared-vSEP clone family** —
+  independently-created installs produce **different** KEK records; the account KEK is
+  vSEP/machine-bound, not a deterministic function of the password.
 - Both independently-extracted volumes' VEKs have an all-zero AES-256-XTS **data** key
   (only the tweak differs) — the zero data key is systematic across the two (n = 2).
 
@@ -766,11 +769,10 @@ XTS oracle. The original disk is never mounted or written.
   26.4.1 kernel, **not yet reproduced end-to-end** against the two known VEKs. The `info`
   string, the `L = 32` length, and the exact split into (zero data ‖ derived tweak) are
   characterized-not-confirmed.
-- That a single extracted KEK yields a *universal* (same-account) offline unlock — a
-  method characterized from the on-disk determinism + the HKDF-from-UUID step, but not
-  demonstrated end-to-end here, and contingent on the `fv_hw_crypt` transform being a
-  pure function of on-disk bytes (if it is SEP-bound, the method narrows to flag-clear
-  volumes).
+- **DISPROVEN** (moved out of inference): that a single extracted KEK yields a *universal*
+  (same-account) offline unlock. The `fv_hw_crypt` device-key transform is SEP-bound — the
+  master key is tangled with the off-disk vSEP UID — so no on-disk-only universal unlock
+  exists across independently-created machines (see the Verification-status header + Part 5).
 
 ## Prior-art check
 
