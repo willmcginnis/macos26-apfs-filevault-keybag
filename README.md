@@ -25,13 +25,18 @@ This write-up serves two audiences:
 > volume.** Host SIP was never disabled at any point; only *guest* SIP-off (inside a
 > VM the author controls) is used, which is a supported operation on a machine you own.
 
-> **Verification status.** Two parts of this write-up — the per-volume **HKDF
-> key-derivation** (Part 3) and the **universal same-account offline-unlock** method
-> (Part 5) — are **characterized from static kernel analysis and are NOT yet verified
-> end-to-end.** They are labelled *characterized / proof-pending* where they appear;
-> the offline reproduction against independently-known keys is still in progress.
-> Everything else — the on-disk keybag format, the failing password/PRK offline paths,
-> and the single-volume VEK-from-RAM recovery — is empirically verified as described.
+> **Verification status (updated 2026-07-28).** The full offline-access chain is now
+> **verified end-to-end** on a genuinely-new volume: the per-volume **HKDF
+> key-derivation** (Part 3) and the **VEK-from-RAM → offline-mount** method both
+> reproduce — real directory listing + file contents + a failing 1-bit-flip negative
+> control, with the target `disk.img` **SHA-256 identical before and after.** What
+> changed the *other* way: the **"universal same-account offline-unlock"** (Part 5) is
+> now **DISPROVEN for independent machines** — the account KEK is **vSEP/machine-bound**,
+> so it holds only within a *shared-vSEP clone family*, not across independently-created
+> installs. The earlier "deterministic KEK across independent volumes" reading was
+> **clone-inheritance** from a shared base image (see Part 5). Everything else — the
+> on-disk keybag format, the failing password/PRK offline paths, and single-volume
+> VEK-from-RAM recovery — remains empirically verified.
 
 ---
 
@@ -41,7 +46,7 @@ This write-up serves two audiences:
 |---|---|---|
 | **Parse the keybag records** | works | Container keybag is AES-XTS under a key derived from the container UUID — no secret needed. Needs the parser fixes in Part 1. |
 | **Password → PBKDF2 → RFC-3394 unwrap of the KEK** | **FAILS** | The KEK is wrapped by a context that is not on disk. On a Virtualization.framework guest that context is the out-of-process **virtual Secure Enclave** (inference). ~150 enumerated variants, two independent implementations, and a second tool (apfs-fuse) all fail the RFC-3394 integrity check. |
-| **Personal Recovery Key (PRK) → RFC-3394 unwrap** | **FAILS (structural)** | The recovery record is an ordinary KEK record (Apple's standard recovery crypto-user UUID `EBC6C064-0000-11AA-AA11-00306543ECAC`) carrying the **same 16-byte wrapping-context value** as the password KEK, so the same SEP binding applies. (We did not hold the actual recovery key to test a correct-PRK unwrap directly — this is the structural argument.) |
+| **Personal Recovery Key (PRK) → RFC-3394 unwrap** | **FAILS (structural)** | The recovery record is an ordinary KEK record (Apple's standard recovery crypto-user UUID `EBC6C064-0000-11AA-AA11-00306543ECAC`) carrying the **same 16-byte wrapping-context value** as the password KEK, so the same SEP binding applies. (Empirically confirmed 2026-07-28: on a fresh install we CAPTURED the actual Personal Recovery Key and tested it — `libfsapfs`'s recovery-password unlock with the correct PRK still FAILS offline, matching the structural argument.) |
 | **Boot once, read the VEK out of guest kernel RAM, then mount `disk.img` offline forever** | **WORKS** | Bulk FileVault decryption in this guest is *software* AES-XTS (no hardware AES engine services bulk reads), so the unwrapped volume key sits in guest kernel memory while the volume is mounted. Extract it, inject it into a patched libfsapfs, mount the image offline thereafter. |
 
 The rest of this document is the byte-level and mechanism detail behind each row.
@@ -156,6 +161,13 @@ bytes differ between record types (`49 00 00 00 02 00` in the KEK records,
 apfs-fuse names the 16-byte field `uuid`; whether it identifies a key-wrapping
 context (relevant to the offline-unlock discussion below) is an **inference**, not
 established by the bytes. Sample size is three records in one container.
+
+> **Update 2026-07-28 (see Part 5): this 16-byte value is the per-install virtual-Secure-Enclave
+> fingerprint.** A genuinely-independent install (fresh IPSW → its own machine identity → its own
+> vSEP) carries a **different** value here — `d4ee8731…` vs this container's `96d725ec…` — while it
+> stays byte-identical across BOTH crypto-user records *within* each install. So the "inference"
+> that it is a key-wrapping context is confirmed, and it is precisely what makes the account KEK
+> **machine-bound** (a foreign-vSEP reader can't unlock — Part 5).
 
 ## The container VEK entry (`KB_TAG_VOLUME_KEY`) — the under-documented part
 
@@ -564,7 +576,7 @@ their own VM.
 
 ---
 
-# Part 5 — Universality: the VEK is not a universal constant, but the KEK path is deterministic
+# Part 5 — Universality: the VEK is not universal, and neither is the account KEK — both are vSEP/machine-bound (the "deterministic KEK" was clone-inheritance; corrected 2026-07-28)
 
 A separate test settled whether the recovered key is anything like an Apple-wide
 constant. It is not — but the result has a second half that is more interesting for
@@ -580,36 +592,46 @@ against its Data volume via the patched oracle.
   the VEK / tweak is NOT a universal Apple constant.** (Where a single recovered VEK
   *had* decrypted several sibling VMs, that was **copy-on-write clone inheritance**:
   they all descended from one base image whose FileVault was enabled once.)
-- **The interesting half: the KEK path is deterministic.** Across the two
-  *independently created* volumes — different lineages, different ECIDs, macOS
-  26.3 vs 26.5.2 — the **volume-keybag KEK records are byte-identical**: same HMAC,
-  same admin crypto-user UUID (`faa413cd…`), same PBKDF2 salt (`5142af0b…`), same
-  `wrapped_kek`, same 16-byte metadata value (`96d725ec…`). So the **password→KEK
-  path is deterministic**, while the **container VEK entry differs** (which is why the
-  cross-inject fails). Deterministic KEK, per-enable VEK.
-- **From open lead to a characterized method (end-to-end proof pending).** Two
-  on-disk facts compose into a route to a *reusable* offline unlock:
-  1. the **KEK is deterministic** per (account, password) — byte-identical on-disk KEK
-     records across independent volumes — yet is **not** offline-derivable from the
-     password (the wrap is SEP-bound); it is obtained **once**, by guest-RAM
-     extraction.
-  2. the per-volume step from KEK to XTS key uses **only on-disk material**:
-     `RFC3394_unwrap(KEK, wrapped_vek)` then `HKDF-SHA256(·, salt = the volume's APFS
-     UUID, info = "vekderivedentropy")` (Part 3).
-
-  Together these characterize a **"boot once, then unlock offline forever — across
-  volumes"** method: extract the deterministic KEK a single time from one volume's
-  boot, then for **any** same-account volume derive its XTS key from that volume's
-  on-disk `wrapped_vek` + UUID alone — no further boot, no SEP, no per-volume
-  extraction. **This is a characterized method, not yet a demonstrated result:** the
-  one-time KEK extraction and the full offline cross-derivation (KEK from volume A →
-  mount volume B from B's on-disk bytes, cross-checked against B's independently
-  RAM-recovered VEK) have not been run to completion here. One dependency gates the
-  *universality* specifically — whether the pre-unwrap `fv_hw_crypt` transform seen in
-  the static read is a pure function of on-disk bytes or is itself SEP-bound; if the
-  latter, the method narrows to flag-clear volumes. Stated honestly: the mechanism is
-  understood end-to-end on paper; the offline end-to-end *demonstration* is the
-  remaining work.
+- **The second half — CORRECTED 2026-07-28: the "deterministic KEK" was
+  CLONE-INHERITANCE, and the account KEK is vSEP/machine-bound.** The two volumes
+  compared here (the original and the "freshly enabled" clone) were BOTH descended from
+  the same upstream `macos-tahoe-base` image, and a Tart copy-on-write clone **inherits
+  the base VM's machine identity — and therefore its virtual Secure Enclave (vSEP)
+  identity.** So their byte-identical KEK records (same admin crypto-user UUID
+  `faa413cd…`, salt `5142af0b…`, `wrapped_kek`, 16-byte metadata `96d725ec…`) reflect a
+  **shared vSEP**, NOT a deterministic function of (account, password). A **genuinely
+  independent install** (fresh IPSW → its own machine identity → its own vSEP), enabled
+  with the *same* `admin`/`admin`, produces a **DIFFERENT** KEK record: different admin
+  UUID (`be0286c6…`), different salt, and — decisively — a **different 16-byte metadata
+  constant, `d4ee8731…` vs `96d725ec…`.** That 16-byte value is shared across BOTH
+  crypto-user records (admin + Personal Recovery) *within* an install and differs
+  *across* installs: it is the **per-install vSEP fingerprint.** Confirmed
+  operationally: a foreign-vSEP reader **rejects the correct passphrase AND the correct
+  Personal Recovery Key.** [FACT, 2026-07-28]
+- **⇒ "Universal same-account offline-unlock" is DISPROVEN for independent machines.**
+  One machine's account KEK does not unlock another machine's volume, even with
+  identical username + password. Universality holds ONLY within a **shared-vSEP clone
+  family** (volumes descended from one base image / sharing a machine identity). The
+  earlier "different-VEK-same-KEK-record rules out clone-inheritance" reasoning was
+  flawed: re-enabling FileVault mints a fresh VEK while the clone-inherited KEK record
+  stays fixed, so "different-VEK-same-record" is fully consistent with clone-inheritance.
+- **What IS now demonstrated end-to-end (2026-07-28): the pristine-target offline-access
+  chain, on a genuinely-new volume.** On a fresh macOS 26.6 install (distinct UUID, its
+  own vSEP, genuine software FileVault): the reader is a **CoW clone** (which shares the
+  target's vSEP) → the clone boots and its Data unlocks via macOS's **FileVault remote
+  unlock over SSH** — the ORIGINAL is never booted or mounted → the VEK/tweak is read
+  from the clone's kernel RAM via a live `dtrace` of the software AES-XTS decrypt path
+  (the data-cipher half reads all-zero there too, per the systematic zero-data-key
+  result) → the clone is shut down → the **untouched
+  original** is offline-mounted with `data(32×00) ‖ tweak` via patched libfsapfs: real
+  directory listing + file contents + a 1-bit-flip negative control that FAILS, with the
+  original `disk.img` **SHA-256 identical before and after.** So "boot once → unlock
+  offline" is real — but the "boot" must be on **that volume's own vSEP lineage** (a
+  clone), and the key is **per-volume, not a universal per-account secret.** The
+  per-volume step from KEK to XTS key still uses only on-disk material
+  (`RFC3394_unwrap(KEK, wrapped_vek)` → `HKDF-SHA256(·, salt = volume UUID, info =
+  "vekderivedentropy")`, Part 3); what does NOT generalize is the KEK across independent
+  machines.
 
 **The zero data key is SYSTEMATIC — not a per-volume anomaly.**
 
