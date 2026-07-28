@@ -652,6 +652,75 @@ per-enable and carries no cross-volume value, so no literal tweak is published h
 
 ---
 
+## Can you unlock offline without booting the VM? (what binds the key to the machine)
+
+Short answer: **not from the disk and password alone.** The volume key is bound to the
+VM's own (emulated) Secure Enclave — so you either run *inside* that VM or a clone of it,
+or you would have to reconstruct a per-VM Secure-Enclave secret, which is an open
+question. The longer answer corrects a common assumption and pins exactly where the wall
+is — and, just as important, where it *isn't*.
+
+**The naive hope.** It is tempting to expect that, given the keybag on disk and the
+password, you could unwrap it in userspace and read the volume without ever booting
+macOS — the way offline tools recover the key for older, software-only FileVault schemes.
+
+**Why it is not that simple — the KEK is machine-bound.** A reader environment that is
+not the original VM (or a clone of it) rejects even the *correct* password and the
+*correct* Personal Recovery Key. The password alone does not unwrap the keybag; something
+tied to the specific machine is folded into the key-encryption key (KEK).
+
+**It is NOT a hardware wall — and not an attestation gate either.** On a physical
+Apple-Silicon Mac the Secure Enclave is a separate coprocessor and the volume key never
+touches CPU RAM. A VM has no such chip: the keybag unwrap and key derivation run in
+*guest-kernel* software (standard PBKDF2 + RFC-3394 + HKDF), and the Secure-Enclave side
+is an *emulated* engine. Crucially there is **no caller-attestation or session gate** —
+nothing checks "who is asking." The key transits guest RAM, which is exactly why reading
+it from a running guest (or from a clone) works. What binds it to the machine is key
+*material*, not an identity check.
+
+**What the machine-binding actually is — and it differs by architecture.** The KEK is not
+`f(password)` alone. Before the keybag is unwrapped, the derived master key passes through
+a **device-key transform**, and that transform is where the machine binding lives. It is
+implemented *differently* on the two architectures — a difference that is easy to miss and
+leads straight to the wrong conclusion:
+
+- **Intel VMs** derive the device key purely in software, as a `PBKDF2` over a machine
+  identifier (`IOPlatformUUID`). That input lives in the VM, so on Intel the device key —
+  and therefore the whole KEK — is offline-reconstructable.
+- **Apple-Silicon (arm64e) VMs do not.** There the master key is *tangled with a per-VM
+  Secure-Enclave secret (the "SEP UID")* inside the guest's **emulated AES engine** — not
+  with a value sitting on the encrypted volume in the clear, and not with the password.
+
+That per-VM SEP UID is exactly what a foreign reader lacks, which is why on the real
+(Apple-Silicon) VMs the correct password *and* the correct recovery key both still fail in
+a different VM. So the entire wall reduces to that one per-VM Secure-Enclave secret.
+
+**So can it be done with no boot at all?** Two ways, and which one is available is the
+open question. **(a)** Run in the *same* Secure-Enclave context — a copy-on-write clone
+of the VM inherits its per-VM secret, so it unlocks (this is the demonstrated method).
+**(b)** Reconstruct the per-VM Secure-Enclave secret offline. Whether (b) is possible
+turns on where that secret comes from: supplied live by the emulated Secure Enclave at
+boot (so it is not reconstructable), or persisted in the host-side VM bundle (so it is
+potentially reconstructable). That question sits one layer below the key-derivation code
+and is **unresolved** — the genuine remaining frontier, not a settled "impossible."
+
+**The host-side shortcut, and why it is walled.** You might try to skip all of this and
+read the running key straight out of the VM's guest RAM from the host. Host **SIP** blocks
+it: guest RAM lives inside a SIP-protected Virtualization platform binary, and
+`task_for_pid` / `gcore` against it are denied even as root while host SIP is on. A
+*modified* VMM (a patched Tart, your own Virtualization.framework harness) does not help —
+the gate is the host-SIP + platform-binary entitlement, not the launcher's code.
+
+**If you do boot a reader, the minimal capture path.** macOS Recovery *unlocks* the Data
+volume fine (`diskutil apfs unlockVolume`) but cannot *dump* the key: it ships no working
+`dtrace` (the library lives only inside the full-system dyld shared cache, absent from
+recovery). The smaller capture is dtrace-free — unlock in a headless throwaway clone, have
+the hypervisor serialize the guest RAM to a file you own
+(`VZVirtualMachine.saveMachineStateTo`), then carve the key offline with a known-plaintext
+XTS oracle. The original disk is never mounted or written.
+
+---
+
 ## Confidence — FACT vs INFERENCE
 
 **FACT:**
