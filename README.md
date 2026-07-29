@@ -32,9 +32,12 @@ This write-up serves two audiences:
 > of Part 3 remains characterized from static disassembly — end-to-end reproduction still
 > pending.) What
 > changed the *other* way: the **"universal same-account offline-unlock"** (Part 5) is
-> now **DISPROVEN for independent machines** — the account KEK is **vSEP/machine-bound**,
-> so it holds only within a *shared-vSEP clone family*, not across independently-created
-> installs. The earlier "deterministic KEK across independent volumes" reading was
+> now **DISPROVEN across independently-created installs (distinct vSEP lineages)** — the
+> account KEK is bound to the VM's vSEP identity, so it holds only within a *shared-vSEP
+> clone family*. Shown **same-host** (a foreign-lineage reader rejects the correct
+> password AND the correct recovery key); whether the same bundle unlocks after a move to
+> a **different physical host** was not tested (the host-SEP design strongly implies not,
+> but that portability is an inference, not a measured result). The earlier "deterministic KEK across independent volumes" reading was
 > **clone-inheritance** from a shared base image (see Part 5). Everything else — the
 > on-disk keybag format, the failing password/PRK offline paths, and single-volume
 > VEK-from-RAM recovery — remains empirically verified.
@@ -349,9 +352,9 @@ memory the whole time the volume is mounted** — which is exactly the material 
 offline password path cannot reconstruct, but a one-time boot exposes.
 
 (The guest's VEK does *not* transit the host VM-runner process's normal heap: that
-process contains no guest-FileVault crypto at all, and the vSEP is a separate,
-out-of-process coprocessor. So the extraction target is the *guest's* RAM, not the
-host runner's.)
+process contains no guest-FileVault crypto at all — the Secure-Enclave side is an
+*emulated*, guest-side engine and the unwrap runs in guest-kernel corecrypto (Part 5).
+So the extraction target is the *guest's* RAM, not the host runner's.)
 
 ## VEK-from-RAM: the working path (for self-recovery)
 
@@ -370,15 +373,16 @@ FUSE mount:
 4. **Invert the schedule to the raw key** (Part 3) and **concatenate data-key-half ‖
    tweak-key-half** to form the AES-XTS VEK.
 5. **Verify the candidate against `disk.img`** with the patched-libfsapfs oracle
-   (Part 3) — correct key lists the real filesystem; a 1-byte-flipped tweak yields
-   garbage.
+   (Part 3) — correct key lists the real filesystem; a 1-bit flip of the all-zero data
+   half yields garbage.
 6. **Mount the image offline, forever after**, with the injected VEK. No further boot
    or SIP change is needed once the context is captured.
 
 This was carried out and independently re-verified. Against this disposable VM's Data
 volume (Volume 5, UUID `66EB31C4-…`), the recovered key decrypts the real filesystem
 (307,216 entries; `/private/etc/{hosts,kcpassword,…}` to exact content), and a
-1-byte-flipped tweak produces `invalid object type` — a positive-and-negative proof.
+1-bit flip of the all-zero **data** half (`00→01`) produces `invalid object type` — a
+positive-and-negative proof.
 The same recovery reproduced on a Linux `fsapfsmount` (below).
 
 ## The one-time boot, minimally: keeping the original image pristine
@@ -490,14 +494,14 @@ tweak key       : 776cbf2b5af564ccbdaa481931a56477e2a719408a424ca1ab1e9fe38e3013
 **The striking observation:** the data-cipher half is **all zero** — the volume's
 confidentiality rests entirely on the 32-byte tweak plus the host `disk.img`
 boundary, not on a per-volume secret data key. This was verified end-to-end by the
-oracle (correct key → 307,216 real entries; flipped tweak → garbage) and re-run
-independently.
+oracle (correct key → 307,216 real entries; a 1-bit flip of the all-zero data half →
+garbage) and re-run independently.
 
 **The 32-byte on-disk VEK → 64-byte runtime key: the per-volume derivation.** The
 on-disk keybag wraps a **32-byte** VEK (the 40-byte RFC-3394 `wrapped_vek` at tag
 `[3]`), while the RAM-recovered runtime key is **64 bytes** (AES-256-XTS). A static
-read of the macOS 26.4.1 kernel's APFS key path (`_unmanaged_vek_unwrap_from_kek`)
-characterizes the mapping as a two-step derivation:
+read of the macOS 26.3 kernel's APFS key path (`_unmanaged_vek_unwrap_from_kek`, in
+`xnu-12377`) characterizes the mapping as a two-step derivation:
 
 ```
 unwrapped = RFC3394_unwrap(KEK, wrapped_vek[40])              -> 32 bytes
@@ -518,7 +522,7 @@ Part 5). This resolves the earlier "why 32 on disk but 64 in RAM?" question in
 principle: the on-disk 32-byte VEK is not the runtime key, it is the HKDF *input*.
 
 **Status: characterized from static disassembly (INFERENCE), not yet proven
-end-to-end.** The chain above is read from the 26.4.1 kernel, not reproduced
+end-to-end.** The chain above is read from the 26.3 kernel, not reproduced
 against ground truth here; the end-to-end check — derive `xts_seed` offline from a
 volume's on-disk `wrapped_vek` + UUID and confirm it equals that volume's
 independently RAM-recovered VEK — is **pending**. Treat the exact byte-level chain
@@ -552,10 +556,13 @@ their own VM.
   the `A6A6…` integrity check with the correct password, cross-checked with two
   independent unwrap implementations (pure-Python RFC-3394 and libfsapfs's C path).
   Reproduced by a **third tool** (apfs-fuse) independently.
-- **Personal Recovery Key → offline unwrap: not achievable (structural).** We did not
-  hold the actual recovery key, so this was not tested with a correct PRK — but both KEK
-  records carry the same 16-byte wrapping-context value, so the recovery KEK is SEP-bound
-  exactly like the password KEK; neither credential unwraps offline. (Candidate
+- **Personal Recovery Key → offline unwrap: not achievable (structural, and empirically
+  confirmed on a fresh install).** For the *sample* container we did not hold its recovery
+  key; but on a *separate fresh install* we captured the real PRK and tested it, and
+  `libfsapfs`'s recovery-password unlock with the correct PRK still FAILS offline (see
+  TL;DR). Both KEK records carry the same 16-byte wrapping-context value, so the recovery
+  KEK is SEP-bound exactly like the password KEK; neither credential unwraps offline.
+  (Candidate
   PRK-normalization sweeps without the real key fail regardless.)
 - **`tart suspend` save-state: not usable.** Per WWDC23, the save-state is
   hardware-encrypted and host+user bound.
@@ -584,10 +591,12 @@ A separate test settled whether the recovered key is anything like an Apple-wide
 constant. It is not — but the result has a second half that is more interesting for
 the format record.
 
-Method: cloned the pristine upstream `macos-tahoe-base` image (ships FileVault OFF),
-enabled FileVault **freshly and independently** on the clone (its own new VEK, macOS
-26.3), let it encrypt to 100%, stopped it, and injected the previously-recovered VEK
-against its Data volume via the patched oracle.
+Method: cloned the upstream `macos-tahoe-base` image — which ships with FileVault
+**pre-enabled**, so the clone inherits the base's account KEK record and
+virtual-Secure-Enclave identity — then **independently re-enabled** FileVault on the
+clone, which mints its **own VEK** distinct from the original's while the clone-inherited
+KEK record stays fixed (macOS 26.3); let it encrypt to 100%, stopped it, and injected the
+previously-recovered VEK against its Data volume via the patched oracle.
 
 - **Result: the inject FAILED** (`invalid object type`, identical to the negative
   control). **The recovered VEK does not decrypt an independently-enabled volume —
@@ -640,17 +649,21 @@ against its Data volume via the patched oracle.
 A RAM extraction of the independently-enabled volume's live VEK settled it
 (oracle-verified: positive decrypt of ~287k real entries + two negative controls).
 That volume is **also AES-256-XTS with an all-zero data-cipher key**, and a
-**different** tweak. So across two independently created volumes — distinct lineages,
-distinct ECIDs, macOS 26.3 vs 26.5.2 — the **data half is all-zero both times while the
-tweak differs**: the zero-data-key property is **systematic**, and only the tweak key
-carries entropy (per-`fdesetup`-enable).
+**different** tweak. So across two same-lineage volumes with distinct `fdesetup`-enables
+(macOS 26.3 and 26.5.2, both `macos-tahoe-base` / shared-vSEP) — and, decisively, on a
+**genuinely independent** fresh-IPSW install (its own vSEP lineage, macOS 26.6, verified
+end-to-end in the section above) — the **data half is all-zero every time while the tweak
+differs**: the zero-data-key property is **systematic** across both same-lineage
+re-enables and an independent install, and only the tweak key carries entropy
+(per-`fdesetup`-enable).
 
 Security consequence: in this VZ software-FileVault path the XTS **data** cipher runs
 under a publicly-known constant (all-zero) key — effectively a fixed, public
 permutation — so confidentiality of these Data volumes rests **entirely** on the secret
 tweak key plus the host `disk.img` boundary, not on any per-volume secret *data* key.
-(n = 2 — a strong systematic inference for the zero data key; the specific tweak is
-per-enable and carries no cross-volume value, so no literal tweak is published here.)
+(n = 3 volumes across 2 independent vSEP lineages — a strong systematic inference for the
+zero data key; the specific tweak is per-enable and carries no cross-volume value, so no
+literal tweak is published here.)
 
 ---
 
@@ -687,8 +700,9 @@ implemented *differently* on the two architectures — a difference that is easy
 leads straight to the wrong conclusion:
 
 - **Intel VMs** derive the device key purely in software, as a `PBKDF2` over a machine
-  identifier (`IOPlatformUUID`). That input lives in the VM, so on Intel the device key —
-  and therefore the whole KEK — is offline-reconstructable.
+  identifier (`IOPlatformUUID`) — established by **static disassembly of the x86 kernel**,
+  not an executed offline Intel unlock. That input lives in the VM, so on Intel the device
+  key — and therefore the whole KEK — is offline-reconstructable.
 - **Apple-Silicon (arm64e) VMs do not.** There the master key is *tangled with a per-VM
   Secure-Enclave secret (the "SEP UID")* inside the guest's **emulated AES engine** — not
   with a value sitting on the encrypted volume in the clear, and not with the password.
@@ -700,11 +714,16 @@ a different VM. So the entire wall reduces to that one per-VM Secure-Enclave sec
 **So can it be done with no boot at all?** Two ways, and which one is available is the
 open question. **(a)** Run in the *same* Secure-Enclave context — a copy-on-write clone
 of the VM inherits its per-VM secret, so it unlocks (this is the demonstrated method).
-**(b)** Reconstruct the per-VM Secure-Enclave secret offline. Whether (b) is possible
-turns on where that secret comes from: supplied live by the emulated Secure Enclave at
-boot (so it is not reconstructable), or persisted in the host-side VM bundle (so it is
-potentially reconstructable). That question sits one layer below the key-derivation code
-and is **unresolved** — the genuine remaining frontier, not a settled "impossible."
+**(b)** Reconstruct the per-VM Secure-Enclave secret offline. The *carrier* is settled: the
+per-VM identity is empirically carried by the VM's **auxiliary storage** (`nvram.bin` /
+`VZMacAuxiliaryStorage`), not by the disk image or the `machineId`/ECID — swapping the
+ECID still unlocked, while replacing the aux killed the boot (which is *why* a CoW clone,
+copying the aux, unlocks). What remains open is whether that aux is self-contained or
+merely a **handle to a host-SEP-resident, non-extractable secret** (strongly evidenced on
+macOS 15+/26 via the Secure-Enclave exclave). If the latter, offline reconstruction is
+foreclosed and the aux only works on its origin host + user. That reconstructability — one
+layer below the key-derivation code — is the genuine remaining frontier, not a settled
+"impossible."
 
 **The host-side shortcut, and why it is walled.** You might try to skip all of this and
 read the running key straight out of the VM's guest RAM from the host. Host **SIP** blocks
@@ -713,13 +732,18 @@ it: guest RAM lives inside a SIP-protected Virtualization platform binary, and
 *modified* VMM (a patched Tart, your own Virtualization.framework harness) does not help —
 the gate is the host-SIP + platform-binary entitlement, not the launcher's code.
 
-**If you do boot a reader, the minimal capture path.** macOS Recovery *unlocks* the Data
-volume fine (`diskutil apfs unlockVolume`) but cannot *dump* the key: it ships no working
-`dtrace` (the library lives only inside the full-system dyld shared cache, absent from
-recovery). The smaller capture is dtrace-free — unlock in a headless throwaway clone, have
-the hypervisor serialize the guest RAM to a file you own
-(`VZVirtualMachine.saveMachineStateTo`), then carve the key offline with a known-plaintext
-XTS oracle. The original disk is never mounted or written.
+**If you do boot a reader, the demonstrated capture path.** The method used here: unlock a
+headless throwaway **clone** (which shares the target's vSEP) and read the software
+AES-XTS key out of its guest kernel RAM via a live `dtrace` of the decrypt path, then
+offline-mount the untouched original. macOS Recovery *unlocks* the Data volume fine
+(`diskutil apfs unlockVolume`) but cannot *dump* the key — it ships no working `dtrace`
+(the library lives only inside the full-system dyld shared cache, absent from recovery). A
+*potentially* smaller, dtrace-free capture would serialize the clone's guest RAM to a file
+you own (`VZVirtualMachine.saveMachineStateTo`) and carve the key offline with a
+known-plaintext XTS oracle — but **this was not executed here, and it is in tension with
+the save-state being reported hardware-encrypted / host-bound (Part 4); whether the
+serialized guest RAM is carveable in the clear is untested.** In every case the original
+disk is never mounted or written.
 
 ---
 
@@ -742,14 +766,15 @@ XTS oracle. The original disk is never mounted or written.
   and must be inverted) — byte-verified.
 - VEK-from-RAM works: a 64-byte AES-256-XTS key that decrypts the Data volume,
   oracle-verified positive (real filesystem, 307,216 entries) and negative
-  (1-byte-flipped tweak → garbage), re-run independently and reproduced as a Linux
-  FUSE mount.
+  (1-bit flip of the all-zero **data** half → garbage), re-run independently and
+  reproduced as a Linux FUSE mount.
 - The VEK is not a universal Apple constant (independent FileVault-enable → inject
   fails). KEK records are byte-identical **only within a shared-vSEP clone family** —
   independently-created installs produce **different** KEK records; the account KEK is
   vSEP/machine-bound, not a deterministic function of the password.
-- Both independently-extracted volumes' VEKs have an all-zero AES-256-XTS **data** key
-  (only the tweak differs) — the zero data key is systematic across the two (n = 2).
+- Every extracted volume's VEK has an all-zero AES-256-XTS **data** key (only the tweak
+  differs) — the zero data key is systematic across three volumes spanning two independent
+  vSEP lineages (n = 3).
 
 **INFERENCE:**
 
@@ -761,12 +786,13 @@ XTS oracle. The original disk is never mounted or written.
 - The relationship between the 32-byte on-disk VEK and the 64-byte runtime key (the
   matching 32-byte non-zero half is suggestive, not confirmed).
 - That the PRK path is SEP-bound like the password path — structural (both KEK records
-  carry the same 16-byte wrapping-context value), not tested with a correct recovery key.
-- That the zero data key is systematic across *all* VZ FileVault volumes (beyond the two
-  measured) — strongly supported at n = 2, not proven beyond the sample.
+  carry the same 16-byte wrapping-context value), now with empirical support: a separate
+  fresh install's real PRK was tested and also failed offline (see TL;DR).
+- That the zero data key is systematic across *all* VZ FileVault volumes (beyond the three
+  measured) — strongly supported at n = 3 (two lineages), not proven beyond the sample.
 - The per-volume `RFC-3394 → HKDF-SHA256(·, salt = volume UUID, info =
   "vekderivedentropy")` derivation (Part 3) — read from a **static** disassembly of the
-  26.4.1 kernel, **not yet reproduced end-to-end** against the two known VEKs. The `info`
+  26.3 kernel, **not yet reproduced end-to-end** against the two known VEKs. The `info`
   string, the `L = 32` length, and the exact split into (zero data ‖ derived tweak) are
   characterized-not-confirmed.
 - **DISPROVEN** (moved out of inference): that a single extracted KEK yields a *universal*
@@ -806,9 +832,10 @@ Elcomsoft / Passware / hashcat; mac_apt / plaso.
 - **Editorial scope — verified-or-omitted.** This write-up asserts only what was
   checked here and deliberately *omits* operational specifics that were not confirmed,
   rather than stating them speculatively. Where a mechanism is understood but its
-  end-to-end reproduction has not been run (the HKDF derivation and the universal
-  same-account unlock), it is labelled **characterized / proof-pending**, not claimed
-  as a result. Less asserted, but each assertion carries its evidence.
+  end-to-end reproduction has not been run (the HKDF derivation), it is labelled
+  **characterized / proof-pending**, not claimed as a result. (The universal same-account
+  unlock is *not* in this bucket — it was tested and **DISPROVEN** across independent
+  installs; see Part 5.) Less asserted, but each assertion carries its evidence.
 
 ## Appendix — full record hex
 
